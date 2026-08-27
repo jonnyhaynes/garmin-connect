@@ -14,7 +14,8 @@ import {
     IOauth1,
     IOauth1Consumer,
     IOauth1Token,
-    IOauth2Token
+    IOauth2Token,
+    MfaCodeCallback
 } from '../garmin/types';
 const crypto = require('crypto');
 
@@ -26,6 +27,10 @@ const PAGE_TITLE_RE = new RegExp('<title>([^<]*)</title>');
 const USER_AGENT_CONNECTMOBILE = 'com.garmin.android.apps.connectmobile';
 const USER_AGENT_BROWSER =
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36';
+const USER_AGENT_MOBILE =
+    'Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148';
+const MOBILE_SSO_CLIENT_ID = 'GCM_ANDROID_DARK';
+const MOBILE_SERVICE = 'https://mobile.integration.garmin.com/gcm/android';
 
 const OAUTH_CONSUMER_URL =
     'https://thegarth.s3.amazonaws.com/oauth_consumer.json';
@@ -177,19 +182,145 @@ export class HttpClient {
      * Login to Garmin Connect
      * @param username
      * @param password
+     * @param getMfaCode - optional async callback that resolves the MFA code
      * @returns {Promise<HttpClient>}
      */
-    async login(username: string, password: string): Promise<HttpClient> {
+    async login(
+        username: string,
+        password: string,
+        getMfaCode?: MfaCodeCallback
+    ): Promise<HttpClient> {
         await this.fetchOauthConsumer();
-        // Step1-3: Get ticket from page.
-        const ticket = await this.getLoginTicket(username, password);
+        // Step1-3: Get ticket from mobile JSON API (supports MFA).
+        const ticket = await this.getLoginTicketMobile(
+            username,
+            password,
+            getMfaCode
+        );
         // Step4: Oauth1
         const oauth1 = await this.getOauth1Token(ticket);
-        // TODO: Handle MFA
-
         // Step 5: Oauth2
         await this.exchange(oauth1);
         return this;
+    }
+
+    private async getLoginTicketMobile(
+        username: string,
+        password: string,
+        getMfaCode?: MfaCodeCallback
+    ): Promise<string> {
+        // Cookie carry: name -> value, populated from set-cookie headers.
+        const cookies = new Map<string, string>();
+        const collectCookies = (setCookie?: string[]): void => {
+            if (!setCookie) {
+                return;
+            }
+            setCookie.forEach((cookie) => {
+                const [pair] = cookie.split(';');
+                const idx = pair.indexOf('=');
+                if (idx > 0) {
+                    cookies.set(
+                        pair.slice(0, idx).trim(),
+                        pair.slice(idx + 1).trim()
+                    );
+                }
+            });
+        };
+        const cookieHeader = (): string =>
+            Array.from(cookies.entries())
+                .map(([name, value]) => `${name}=${value}`)
+                .join('; ');
+
+        const params = {
+            clientId: MOBILE_SSO_CLIENT_ID,
+            locale: 'en-US',
+            service: MOBILE_SERVICE
+        };
+
+        // Step1: Prime cookies (SESSION + Cloudflare).
+        const step1Response = await axios.get(
+            `${this.url.GARMIN_SSO_ORIGIN}/mobile/sso/en/sign-in`,
+            {
+                params: { clientId: MOBILE_SSO_CLIENT_ID },
+                headers: { 'User-Agent': USER_AGENT_MOBILE },
+                validateStatus: () => true
+            }
+        );
+        collectCookies(step1Response.headers['set-cookie']);
+
+        // Step2: Login.
+        const step2Response = await axios.post(
+            `${this.url.GARMIN_SSO_ORIGIN}/mobile/api/login`,
+            {
+                username,
+                password,
+                rememberMe: false,
+                captchaToken: ''
+            },
+            {
+                params,
+                headers: {
+                    'Content-Type': 'application/json',
+                    'User-Agent': USER_AGENT_MOBILE,
+                    Cookie: cookieHeader()
+                },
+                validateStatus: () => true
+            }
+        );
+        collectCookies(step2Response.headers['set-cookie']);
+        const loginData = step2Response.data;
+        const loginType = loginData?.responseStatus?.type;
+
+        if (loginType === 'SUCCESSFUL') {
+            return loginData.serviceTicketId;
+        }
+
+        // Step3: MFA branch.
+        if (loginType === 'MFA_REQUIRED') {
+            if (!getMfaCode) {
+                throw new Error(
+                    'login failed (MFA required) — pass a getMfaCode callback to login()'
+                );
+            }
+            const mfaMethod =
+                loginData?.customerMfaInfo?.mfaLastMethodUsed ?? 'email';
+            const code = await getMfaCode();
+            const mfaResponse = await axios.post(
+                `${this.url.GARMIN_SSO_ORIGIN}/mobile/api/mfa/verifyCode`,
+                {
+                    mfaMethod,
+                    mfaVerificationCode: code,
+                    rememberMyBrowser: false,
+                    reconsentList: [],
+                    mfaSetup: false
+                },
+                {
+                    params,
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'User-Agent': USER_AGENT_MOBILE,
+                        Cookie: cookieHeader()
+                    },
+                    validateStatus: () => true
+                }
+            );
+            collectCookies(mfaResponse.headers['set-cookie']);
+            const mfaData = mfaResponse.data;
+            if (mfaData?.responseStatus?.type !== 'SUCCESSFUL') {
+                throw new Error(
+                    `login failed (MFA verify): ${
+                        mfaData?.responseStatus?.message ?? 'unknown error'
+                    }`
+                );
+            }
+            return mfaData.serviceTicketId;
+        }
+
+        throw new Error(
+            `login failed (${loginType ?? 'unknown'}): ${
+                loginData?.responseStatus?.message ?? 'unknown error'
+            }`
+        );
     }
 
     private async getLoginTicket(
@@ -320,7 +451,7 @@ export class HttpClient {
         }
         const params = {
             ticket,
-            'login-url': this.url.GARMIN_SSO_EMBED,
+            'login-url': MOBILE_SERVICE,
             'accepts-mfa-tokens': true
         };
         const url = `${this.url.OAUTH_URL}/preauthorized?${qs.stringify(
@@ -371,23 +502,33 @@ export class HttpClient {
         // console.log('exchange - token:', token);
 
         const baseUrl = `${this.url.OAUTH_URL}/exchange/user/2.0`;
+        // Form body: audience is required; carry mfa_token if the oauth1 step returned one.
+        const body: Record<string, string> = {
+            audience: 'GARMIN_CONNECT_MOBILE_ANDROID_DI'
+        };
+        if (oauth1.token.mfa_token) {
+            body.mfa_token = oauth1.token.mfa_token;
+        }
         const requestData = {
             url: baseUrl,
             method: 'POST',
-            data: null
+            data: body
         };
 
         const step5AuthData = oauth1.oauth.authorize(requestData, token);
-        // console.log('login - step5AuthData:', step5AuthData);
-        const url = `${baseUrl}?${qs.stringify(step5AuthData)}`;
-        // console.log('exchange - url:', url);
+        const headers = oauth1.oauth.toHeader(step5AuthData);
         this.oauth2Token = undefined;
-        const response = await this.post<IOauth2Token>(url, null, {
-            headers: {
-                'User-Agent': USER_AGENT_CONNECTMOBILE,
-                'Content-Type': 'application/x-www-form-urlencoded'
+        const response = await this.post<IOauth2Token>(
+            baseUrl,
+            qs.stringify(body),
+            {
+                headers: {
+                    ...headers,
+                    'User-Agent': USER_AGENT_CONNECTMOBILE,
+                    'Content-Type': 'application/x-www-form-urlencoded'
+                }
             }
-        });
+        );
         // console.log('exchange - response:', response);
         this.oauth2Token = this.setOauth2TokenExpiresAt(response);
         // console.log('exchange - oauth2Token:', this.oauth2Token);

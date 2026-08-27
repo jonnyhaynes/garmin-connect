@@ -234,7 +234,10 @@ export interface IGarminTokens {
 export interface IOauth1Token {
     oauth_token: string;
     oauth_token_secret: string;
+    mfa_token?: string;
 }
+
+export type MfaCodeCallback = () => Promise<string> | string;
 
 export interface IOauth2Token {
     // from Garmin API
