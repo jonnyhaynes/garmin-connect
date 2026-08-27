@@ -13,6 +13,7 @@ This document provides detailed information about the public API methods availab
 -   [Authentication](#authentication)
     -   [Constructor](#constructor)
     -   [Login](#login)
+        -   [Multi-factor authentication (MFA)](#multi-factor-authentication-mfa)
     -   [Session Management](#session-management)
 -   [User Data](#user-data)
     -   [User Profile](#user-profile)
@@ -71,9 +72,14 @@ You can also provide a configuration file named `garmin.config.json` at your pro
  * Login to Garmin Connect with provided credentials or those set during construction
  * @param username - Optional username to override the one in credentials
  * @param password - Optional password to override the one in credentials
+ * @param getMfaCode - Optional async callback that resolves the MFA code (see below)
  * @returns The GarminConnect instance for chaining
  */
-async login(username?: string, password?: string): Promise<GarminConnect>
+async login(
+    username?: string,
+    password?: string,
+    getMfaCode?: () => Promise<string> | string
+): Promise<GarminConnect>
 ```
 
 Example:
@@ -83,6 +89,29 @@ await GCClient.login();
 // Or with specific credentials
 await GCClient.login('my.email@example.com', 'MySecretPassword');
 ```
+
+#### Multi-factor authentication (MFA)
+
+If the account has MFA enabled, pass a `getMfaCode` callback as the third
+argument. It is called only when Garmin issues an MFA challenge, and should
+resolve the one-time code (e.g. the code emailed to you, or from an
+authenticator app):
+
+```js
+await GCClient.login('my.email@example.com', 'MySecretPassword', async () => {
+    // Return the one-time code however you like — prompt, read a file, etc.
+    return await promptForMfaCode();
+});
+```
+
+Notes:
+
+-   The callback is **optional** — non-MFA accounts log in exactly as before.
+-   If the account requires MFA and no callback is supplied, `login()` throws
+    a clear error rather than failing with an opaque "ticket not found".
+-   MFA is only prompted at the interactive login. Once you
+    [export the token bundle](#session-management) and reload it later, no MFA
+    is required — the tokens carry the session.
 
 ### Session Management
 
